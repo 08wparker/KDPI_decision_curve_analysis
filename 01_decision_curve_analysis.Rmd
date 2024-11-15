@@ -1,0 +1,260 @@
+---
+title: "Decision curve analysis for KDPI"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(haven)
+library(survival)
+```
+
+```{r}
+tx_ki <- read_sas("tx_ki.sas7dbat")
+```
+
+```{r}
+start_date <- as.Date("2010-01-01")
+end_date <- as.Date("2015-12-31")
+
+# KDRI mapping table parameters downloaded from https://optn.transplant.hrsa.gov/media/wnmnxxzu/kdpi_mapping_table.pdf on 11/15/2024
+scaling_factor <- 1.30900852563932 
+diab_unknown <- 0.14911770409153
+htn_unknown <- 0.38116475987331
+
+# Filter dataset and calculate KDRI
+study_cohort <- tx_ki %>%
+  filter(REC_TX_DT >= start_date & REC_TX_DT <= end_date & REC_AGE_AT_TX >= 18) %>%
+  mutate(
+    KDRI_X = 0.0128 * (DON_AGE - 40) +
+      if_else(DON_AGE < 18, -0.0194 * (DON_AGE - 18), 0) +
+      if_else(DON_AGE > 50, 0.0107 * (DON_AGE - 50), 0) +
+      -0.0464 * ((DON_HGT_CM - 170) / 10) +
+      if_else(DON_WGT_KG < 80, -0.0199 * ((DON_WGT_KG - 80) / 5), 0) +
+      case_when(
+        DON_RACE == 8 ~ 0.1790,
+        TRUE ~ 0
+      ) +
+      case_when(
+        DON_HTN == 1 ~ 0.1260,
+        is.na(DON_HTN) ~ 0.1260 * htn_unknown,
+        TRUE ~ 0
+      ) +
+      case_when(
+        DON_HIST_DIAB %in% c(2, 3, 4, 5) ~ 0.1300,
+        DON_HIST_DIAB == 998 ~ 0.1300 * diab_unknown,
+        TRUE ~ 0.1300 * diab_unknown
+      ) +
+      case_when(
+        DON_CAD_DON_COD == 2 ~ 0.0881,
+        TRUE ~ 0
+      ) +
+      0.2200 * (DON_CREAT - 1) +
+      if_else(DON_CREAT > 1.5, -0.2090 * (DON_CREAT - 1.5), 0) +
+      case_when(
+        DON_ANTI_HCV == "P" ~ 0.2400,
+        TRUE ~ 0
+      ) +
+      case_when(
+        DON_NON_HR_BEAT == 1 ~ 0.1330,
+        TRUE ~ 0
+      )
+  ) %>%
+  mutate(
+    KDRI = exp(KDRI_X),
+    KDRI_normalized = KDRI /scaling_factor,
+    # Calculate the follow-up time as the difference between the transplant date and the event date
+    time = case_when(
+      !is.na(REC_FAIL_DT) ~ as.numeric(difftime(REC_FAIL_DT, REC_TX_DT, units = "days")),
+      !is.na(TFL_DEATH_DT) ~ as.numeric(difftime(TFL_DEATH_DT, REC_TX_DT, units = "days")),
+      !is.na(TFL_LAFUDATE) ~ as.numeric(difftime(TFL_LAFUDATE, REC_TX_DT, units = "days")),
+      TRUE ~ NA_real_
+    ),
+    # Create the failure variable (1 if failure or death occurred, 0 if censored)
+    failure = case_when(
+      !is.na(REC_FAIL_DT) | TFL_LASTATUS == "D" ~ 1,  # Graft failure or death
+      TRUE ~ 0  # Censored
+    )# Replace with current scaling factor if available
+  )
+
+```
+
+## missing KDRI values from patient's who are missing `DON_CREAT`
+```{r}
+study_cohort %>%
+  pull(DON_CREAT) %>%
+  summary()
+```
+
+### Load in KDRI -> KDPI mapping table
+Based on the OPTN database as of September 06, 2024, downloaded https://optn.transplant.hrsa.gov/media/wnmnxxzu/kdpi_mapping_table.pdf on 11/15/2024.
+```{r}
+kdpi_mapping <- read_csv("kdpi_mapping_table.csv")
+```
+```{r}
+# Define the function that finds the KDPI for a given KDRI value
+find_kdpi <- function(kdri_value) {
+  row <- kdpi_mapping %>%
+    filter(KDRI_min <= kdri_value, KDRI_max >= kdri_value)
+  
+  if (nrow(row) > 0) {
+    return(as.character(row$KDPI))
+  } else {
+    return(NA_character_)
+  }
+}
+
+# Apply the KDPI mapping to the study cohort using `purrr::map()`
+study_cohort <- study_cohort %>%
+  mutate(KDPI = map_chr(KDRI_normalized, find_kdpi)) %>%
+  mutate(KDPI = as.numeric(str_replace(KDPI, "%", ""))) %>%
+  filter(is.na(KDPI) == FALSE)
+```
+
+
+```{r}
+# Fit a Cox proportional hazards model to assess the relationship between KDRI and graft survival
+cox_model <- coxph(Surv(time, failure) ~ KDRI_X, data = study_cohort)
+
+# Print summary of the model
+summary(cox_model)
+```
+
+
+```{r}
+kdri_to_plot <- kdpi_mapping %>%
+  mutate(KDPI = as.numeric(str_replace(KDPI, "%", ""))) %>%
+  filter(KDPI > 0 & KDPI < 100) %>%
+  select(KDRI_max, KDPI) %>%
+  mutate(KDRI = KDRI_max*scaling_factor,
+         KDRI_X = log(KDRI))
+
+# Define the time point for prediction (5 years = 5 * 365.25 days)
+time_point <- round(5 * 365.25)
+
+xbetas <- predict(cox_model, newdata = kdri_to_plot)
+
+# Extract the cumulative baseline hazard at 5 years
+hazard_at_5_years <- basehaz(cox_model) %>%
+  filter(time == time_point) %>%
+  pull(hazard)
+
+# Calculate the 5-year survival probability for each KDPI value
+kdri_to_plot <- kdri_to_plot %>%
+  cbind(xbeta = xbetas) %>% 
+  mutate(
+    surv_prob_5yr = exp(-hazard_at_5_years * exp(xbeta))
+  )
+```
+
+```{r}
+kdri_to_plot %>%
+  ggplot(aes(x= KDPI, y = surv_prob_5yr)) +
+  geom_line() + labs(y = "Graft survival at 5-years")
+```
+
+```{r}
+for_dca <- study_cohort %>%
+  mutate(five_year_survival = ifelse(time> 5*365, 1, 0)) %>%
+  select(PX_ID, KDPI, KDRI_normalized, time, failure, five_year_survival) %>%
+  filter(is.na(KDPI)== FALSE)
+```
+
+```{r}
+# Define the function to calculate the confusion matrix for a given KDPI threshold
+confusion_matrix <- function(KDPI_threshold, time = 365 * 5) {
+  
+  # Subset of kidneys with KDPI <= threshold (accepted kidneys)
+  accepted_kidneys <- for_dca %>% filter(KDPI <= KDPI_threshold)
+  
+  # Probability of accepting a kidney (P(x = 1))
+  p_accept <- nrow(accepted_kidneys) / nrow(for_dca)
+  
+  # Kaplan-Meier survival curve for accepted kidneys
+  accepted_km <- survfit(Surv(time, failure) ~ 1, data = accepted_kidneys)
+  
+  # Extract the survival probability at the given time point for accepted kidneys
+  survival_at_time <- summary(accepted_km, times = time)$surv
+  
+  # Calculate accepted kidneys that survive and fail
+  accept_survive <- survival_at_time * p_accept * nrow(for_dca)
+  accept_fail <- (1 - survival_at_time) * p_accept * nrow(for_dca)
+  
+  # Subset of kidneys with KDPI > threshold (rejected kidneys)
+  rejected_kidneys <- for_dca %>% filter(KDPI > KDPI_threshold)
+  
+  # Probability of rejecting a kidney (P(x = 0))
+  p_reject <- nrow(rejected_kidneys) / nrow(for_dca)
+  
+  # Kaplan-Meier survival curve for rejected kidneys
+  rejected_km <- survfit(Surv(time, failure) ~ 1, data = rejected_kidneys)
+  
+  # Extract the survival probability at the given time point for rejected kidneys
+  survival_at_time_rejected <- summary(rejected_km, times = time)$surv
+  
+  # Calculate rejected kidneys that would survive and fail
+  reject_survive <- survival_at_time_rejected * p_reject * nrow(for_dca)
+  reject_fail <- (1 - survival_at_time_rejected) * p_reject * nrow(for_dca)
+  
+  # Create a tibble to return the confusion matrix
+  cm_tibble <- tibble(
+    KDPI = KDPI_threshold,
+    proportion_accepted = p_accept,
+    total_kidneys = nrow(for_dca),
+    accept_survive = accept_survive,
+    accept_fail = accept_fail,
+    reject_survive = reject_survive,
+    reject_fail = reject_fail
+  ) %>%
+    mutate(check_sum = accept_survive + accept_fail + reject_survive+ reject_fail)
+  
+  return(cm_tibble)
+}
+
+
+```
+```{r}
+# Apply the confusion_matrix function to each row of kdri_to_plot using map_dfr()
+confusion_matrices <- map_dfr(kdri_to_plot$KDPI, ~ confusion_matrix(.x))
+```
+
+
+## Expected relationship between KDPI and proportion of organs accepted
+```{r}
+confusion_matrices %>%
+  ggplot(aes(x=KDPI, y = proportion_accepted)) +
+  geom_point()
+```
+
+### Net benefit for patients who accept the kidney
+```{r}
+overall_five_year_survival <- summary(survfit(Surv(time, failure) ~ 1, for_dca), times = time_point)$surv
+
+for_dca_plot <- confusion_matrices %>%
+  left_join(kdri_to_plot) %>%
+  mutate(net_benefit_kdpi = (1/total_kidneys)*(accept_survive - accept_fail*(surv_prob_5yr)/(1-surv_prob_5yr)),
+         net_benefit_accept_none = 0,
+         net_benefit_accept_all = overall_five_year_survival - (1-overall_five_year_survival)*(surv_prob_5yr/(1-surv_prob_5yr))) 
+
+for_dca_plot %>%
+  select(KDPI, starts_with("net_benefit")) %>%
+  pivot_longer(cols = starts_with("net_benefit"), names_prefix = "net_benefit_") %>%
+  ggplot(aes(x = KDPI, y = value, color = name)) + 
+  geom_line() + labs(x = "KDPI acceptance threshold", y = "Net benefit of accepting")
+```
+```{r}
+for_dca_plot %>%
+  select(surv_prob_5yr, starts_with("net_benefit")) %>%
+  pivot_longer(cols = starts_with("net_benefit"), names_prefix = "net_benefit_") %>%
+  ggplot(aes(x = surv_prob_5yr, y = value, color = name)) + 
+  geom_line() + labs(x = "5-year survival threshold for accepting", y = "Net benefit of accepting")
+```
+
+```{r}
+for_dca_plot %>%
+  select(KDRI, starts_with("net_benefit")) %>%
+  pivot_longer(cols = starts_with("net_benefit"), names_prefix = "net_benefit_") %>%
+  ggplot(aes(x = KDRI, y = value, color = name)) + 
+  geom_line() + labs(x = "KDRI threshold for accepting", y = "Net benefit of accepting")
+```
+
