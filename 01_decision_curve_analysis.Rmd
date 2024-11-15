@@ -9,10 +9,13 @@ library(haven)
 library(survival)
 ```
 
+# Load in SRTR `TX_KI` file
+This analysis used the Q1 2024 SAF
 ```{r}
 tx_ki <- read_sas("tx_ki.sas7dbat")
 ```
 
+# Calculate KDRI
 ```{r}
 start_date <- as.Date("2010-01-01")
 end_date <- as.Date("2015-12-31")
@@ -79,19 +82,18 @@ study_cohort <- tx_ki %>%
 
 ```
 
-## missing KDRI values from patient's who are missing `DON_CREAT`
+## Note: missing KDRI values from patient's who are missing `DON_CREAT`
 ```{r}
 study_cohort %>%
   pull(DON_CREAT) %>%
   summary()
 ```
 
-### Load in KDRI -> KDPI mapping table
-Based on the OPTN database as of September 06, 2024, downloaded https://optn.transplant.hrsa.gov/media/wnmnxxzu/kdpi_mapping_table.pdf on 11/15/2024.
+## Load in KDRI -> KDPI mapping table
+Based on the OPTN database as of September 06, 2024, downloaded https://optn.transplant.hrsa.gov/media/wnmnxxzu/kdpi_mapping_table.pdf on 11/15/2024
 ```{r}
 kdpi_mapping <- read_csv("kdpi_mapping_table.csv")
-```
-```{r}
+
 # Define the function that finds the KDPI for a given KDRI value
 find_kdpi <- function(kdri_value) {
   row <- kdpi_mapping %>%
@@ -112,6 +114,7 @@ study_cohort <- study_cohort %>%
 ```
 
 
+## Cox model to map KDRI -> predicted survival (e.g. $S(t|KDRI)$).
 ```{r}
 # Fit a Cox proportional hazards model to assess the relationship between KDRI and graft survival
 cox_model <- coxph(Surv(time, failure) ~ KDRI_X, data = study_cohort)
@@ -120,7 +123,7 @@ cox_model <- coxph(Surv(time, failure) ~ KDRI_X, data = study_cohort)
 summary(cox_model)
 ```
 
-
+### generate predicted survival at 5-years
 ```{r}
 kdri_to_plot <- kdpi_mapping %>%
   mutate(KDPI = as.numeric(str_replace(KDPI, "%", ""))) %>%
@@ -211,9 +214,6 @@ confusion_matrix <- function(KDPI_threshold, time = 365 * 5) {
   return(cm_tibble)
 }
 
-
-```
-```{r}
 # Apply the confusion_matrix function to each row of kdri_to_plot using map_dfr()
 confusion_matrices <- map_dfr(kdri_to_plot$KDPI, ~ confusion_matrix(.x))
 ```
